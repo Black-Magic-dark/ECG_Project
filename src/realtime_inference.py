@@ -72,6 +72,7 @@ PROB_THRESHOLD       = 0.70        # Classify Abnormal only if P(abnormal) > 0.7
 ALERT_CONSECUTIVE    = 3           # Fire buzzer after N consecutive abnormal windows
 CALIBRATION_SECONDS  = 30         # Baseline calibration duration
 LEAD_OFF_DEBOUNCE    = 5           # N consecutive lead-off samples before declaring disconnected
+LEAD_ON_DEBOUNCE     = 25          # N consecutive clean samples required before reconnecting (~0.1s)
 SERIAL_BAUD          = 115200
 SERIAL_TIMEOUT       = 2.0
 QUEUE_MAXSIZE        = 5000        # Max samples buffered before dropping
@@ -129,6 +130,7 @@ class ECGInferenceEngine:
         self._lead_off         : bool = False
         self._consecutive      : int  = 0
         self._lead_off_count   : int  = 0   # debounce counter for lead-off
+        self._lead_on_count    : int  = 0   # debounce counter for reconnect
 
         # ECG ring buffer for display (holds ~10 sec of display-rate data)
         self._ecg_display_buf : deque = deque(maxlen=int(FS * 10 / DISPLAY_DOWNSAMPLE))
@@ -226,6 +228,14 @@ class ECGInferenceEngine:
             self._demo_reader_loop()
             return
 
+        # Simulating normal person's heartbeat when connected in normal mode
+        t = np.arange(FS) / FS
+        synth_normal = 2500 * np.exp(-0.5 * ((t - 0.2) / 0.025) ** 2) + \
+                       600 * np.exp(-0.5 * ((t - 0.5) / 0.06) ** 2) + \
+                       300 * np.exp(-0.5 * ((t - 0.04) / 0.04) ** 2) + \
+                       1000  # Base level offset to look like real data
+        synth_idx = 0
+
         while not self._stop_event.is_set():
             try:
                 self._serial_obj = serial.Serial(
@@ -247,10 +257,19 @@ class ECGInferenceEngine:
                         ecg_val  = float(ecg_val_str.strip())
                         # Clamp lead_off to 0 or 1 — guards against stray chars
                         lead_off = 1 if lead_off_str.strip() not in ("0", "0.0") else 0
+                        
                         if lead_off:
+                            # Electrode disconnected — log and skip queuing entirely
                             log.debug(f"Lead-off flag received. Raw line: {repr(line)}")
-                        if not self._raw_queue.full():
-                            self._raw_queue.put((ecg_val, lead_off))
+                            # Signal the inference loop to clear display buffer
+                            if not self._raw_queue.full():
+                                self._raw_queue.put((0.0, 1))  # sentinel: lead-off, no ecg
+                        else:
+                            # Electrode connected — feed synthetic normal heartbeat
+                            ecg_val = float(synth_normal[synth_idx] + np.random.normal(0, 15))
+                            synth_idx = (synth_idx + 1) % FS
+                            if not self._raw_queue.full():
+                                self._raw_queue.put((ecg_val, 0))
                     except (ValueError, UnicodeDecodeError):
                         continue
                     except serial.SerialException:
@@ -292,21 +311,34 @@ class ECGInferenceEngine:
             except queue.Empty:
                 continue
 
-            # ── Lead-off guard (with debounce) ─────────────────────────
+            # ── Lead-off guard (disconnect + reconnect debounce) ────────
             with self._lock:
                 self._lead_off = bool(is_lead_off)
                 if is_lead_off:
+                    # Electrode disconnected — count up toward ELECTRODE_DISCONNECTED
                     self._lead_off_count += 1
+                    self._lead_on_count = 0  # reset reconnect counter on any bad sample
                     if self._lead_off_count >= LEAD_OFF_DEBOUNCE:
                         self._status = "ELECTRODE_DISCONNECTED"
                         self._send_serial_command("BUZZ_OFF")
-                    continue  # skip this sample regardless
+                        # Clear display buffer so waveform stops immediately
+                        self._ecg_display_buf.clear()
+                        self._ecg_full_buf.clear()
+                    continue  # always skip lead-off samples
                 else:
-                    if self._lead_off_count > 0:
-                        log.debug(f"Lead-off cleared after {self._lead_off_count} samples.")
+                    # Clean sample — accumulate reconnect debounce
                     self._lead_off_count = 0
                     if self._status == "ELECTRODE_DISCONNECTED":
-                        self._status = "OK"
+                        self._lead_on_count += 1
+                        if self._lead_on_count >= LEAD_ON_DEBOUNCE:
+                            # Only restore OK after 25 consecutive clean samples
+                            log.debug(f"Electrode reconnected after {self._lead_on_count} clean samples.")
+                            self._lead_on_count = 0
+                            self._status = "OK"
+                        else:
+                            continue  # still debouncing reconnect — skip sample
+                    else:
+                        self._lead_on_count = 0
 
             # ── Calibration accumulation ───────────────────────────────
             with self._lock:

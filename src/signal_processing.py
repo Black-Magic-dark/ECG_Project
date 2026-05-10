@@ -67,7 +67,7 @@ def pan_tompkins_qrs(signal: np.ndarray, fs: float = 250.0) -> np.ndarray:
     Pan-Tompkins QRS detection algorithm.
 
     Pipeline:
-      1. Derivative filter  — accentuates QRS slopes
+      1. Derivative filter  — make more noticable QRS slopes
       2. Squaring           — amplifies large values, ensures positivity
       3. Moving window integration (window = 0.15 s)
       4. Adaptive thresholding with signal/noise peak tracking
