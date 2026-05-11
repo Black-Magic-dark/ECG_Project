@@ -1,161 +1,188 @@
-# ECG Project — Knowledge Base
+# ECG Project — Knowledge Base (v2: RPi Edge Architecture)
 > Single source of truth for all technical decisions, schemas, APIs, and environment setup.
-> Updated as the project evolves. Any LLM assisting this project should read this first.
+> **Architecture Version**: v2 — Raspberry Pi 4B Edge AI Node (updated from ESP32 cloud approach).
+> Any LLM assisting this project should read this file completely before making any changes.
 
 ---
 
 ## 1. Project Overview
 
-An AI-powered remote ECG monitoring system for hospitals.
+An AI-powered remote ECG monitoring system for hospitals, using Edge AI on a Raspberry Pi.
 
-- **Hardware**: ESP32 microcontroller + AD8232 ECG sensor (one unit per hospital room).
-- **ML Pipeline**: Real-time Python inference using a trained Random Forest classifier (`ecg_rf_model_v1.pkl`).
-- **Backend**: Flask + Socket.IO server serving a REST API and WebSocket stream.
-- **Frontend**: React (Vite) SPA with role-based dashboards.
-- **Database**: MongoDB Atlas (NoSQL, free M0 tier).
+- **Hardware Layer**: AD8232 ECG sensor → ESP32 (dumb USB ADC bridge, no WiFi) → Raspberry Pi 4B via USB serial
+- **Edge AI Layer**: RPi 4B runs the full Python ML inference pipeline locally (offline-capable)
+- **Cloud Layer**: Thin Flask REST API on Render — stores 5-second summaries and alerts, serves the React UI
+- **Frontend**: React (Vite) SPA on Vercel — role-based dashboards for Admin, Doctor/Nurse, Patient
+- **Database**: MongoDB Atlas (free M0) — stores only summaries and alerts, NOT raw waveform
 
 ---
 
-## 2. Repository Structure
+## 2. Architecture Decision Log
+
+### v1 (Abandoned) — ESP32 Cloud Approach
+- ESP32 would handle WiFi + HTTP POST of raw ECG to a cloud Flask server
+- Cloud Flask server would run ML inference (14MB Random Forest model on Render)
+- **Rejected because**:
+  - Render free tier cold starts (50s) would lose patient data during sleep
+  - 14MB model deserialization race condition on cold start
+  - Sending 250Hz raw ECG over internet is expensive and fragile
+  - ESP32 HTTP overhead at high frequency is unsustainable
+  - `eventlet` vs `threading` conflict with existing inference architecture
+
+### v2 (Current) — Raspberry Pi 4B Edge AI
+- ESP32 is a dumb USB serial ADC — exactly what it already does, zero firmware changes needed
+- RPi 4B reads Serial, runs full ML pipeline locally (the existing Python code works as-is)
+- Only 5-second summaries and alerts go to the cloud — massively reduced bandwidth and DB load
+- Cloud API is thin and stateless — no ML model, no heavy compute — free tier is now sustainable
+- **Benefits**: Works offline, better ADC quality path, "Edge AI" is a stronger academic pitch
+
+---
+
+## 3. Repository Structure
 
 ```
-ECG_Project/
-├── backend/                  ← Flask server, ML inference, REST API
+ECG_Project/                    ← Dev monorepo (stays local / GitHub for reference)
+├── backend/
 │   ├── src/
-│   │   ├── signal_processing.py     # Butterworth filter + Pan-Tompkins QRS
-│   │   ├── feature_extraction.py    # 6 HRV features + SQI
-│   │   ├── realtime_inference.py    # ECGInferenceEngine (threading model)
-│   │   └── ecg_simulator.py         # Demo mode ECG simulator
+│   │   ├── signal_processing.py      # Butterworth filter + Pan-Tompkins QRS (unchanged)
+│   │   ├── feature_extraction.py     # 6 HRV features + SQI (unchanged)
+│   │   ├── realtime_inference.py     # ECGInferenceEngine — runs on RPi (unchanged)
+│   │   └── ecg_simulator.py          # Demo mode simulator (unchanged)
 │   ├── model/
-│   │   ├── ecg_rf_model_v1.pkl      # Trained RandomForest (14MB)
-│   │   ├── scaler_v1.pkl            # StandardScaler
+│   │   ├── ecg_rf_model_v1.pkl       # 14MB Random Forest — deployed to RPi, NOT Render
+│   │   ├── scaler_v1.pkl             # StandardScaler
 │   │   └── model_metadata.json
-│   ├── logs/                        # Session CSV logs (gitignored)
-│   ├── server.py                    # Flask app entry point
-│   └── requirements.txt             # Production deps only (no eventlet, no wfdb)
+│   ├── logs/                         # Local session logs (gitignored)
+│   ├── server.py                     # RPi EDGE server — inference + local WebSocket
+│   ├── cloud_api.py                  # NEW: Render CLOUD API — thin REST only
+│   ├── database.py                   # NEW: MongoDB connection singleton
+│   ├── requirements.txt              # RPi + dev deps
+│   └── cloud_requirements.txt        # NEW: Render-only deps (no scipy/joblib/pyserial)
 │
 ├── frontend/
-│   ├── react_app/            ← Vite + React SPA
-│   └── legacy_dashboard/     ← OLD Streamlit/HTML — to be DELETED
+│   └── react_app/               ← Vite + React SPA → deployed to Vercel
 │
 ├── firmware/
 │   └── ECG_Firmware/
-│       └── ECG_Firmware.ino  ← ESP32 Arduino code (needs WiFi rewrite)
+│       └── ECG_Firmware.ino     ← ESP32 dumb ADC bridge — NO CHANGES NEEDED
 │
-├── ml_training/              ← Offline training only, never deployed
-│   ├── model/
-│   │   ├── data_preparation.py
-│   │   ├── model_training.py
-│   │   ├── model_evaluation.py
-│   │   └── features_dataset.csv
-│   └── requirements.txt      ← Training-only deps (wfdb, matplotlib etc.)
+├── ml_training/                 ← Offline training only, never deployed anywhere
+│   ├── model/                   # Training scripts + dataset
+│   └── assets/                  # Evaluation plots
 │
-├── tests/                    ← pytest unit tests for backend/src/
-├── assets/                   ← ML evaluation plots (to be moved to ml_training/assets/)
-├── .env.example              ← Template — copy to .env and fill in real values
+├── tests/                       # pytest unit tests (run from dev machine)
+├── .env.example                 # Credential template
 ├── .gitignore
-├── conftest.py               ← pytest path config (points to backend/src/)
+├── conftest.py                  # pytest config (points to backend/src/)
 ├── todo_Feature.md
 └── knowledge_base.md
 ```
 
 ---
 
-## 3. Technology Stack Decisions
+## 4. Full Technology Stack
 
-| Layer | Technology | Reason |
-|-------|-----------|--------|
-| Backend language | Python 3.11 | ML ecosystem, existing code |
-| Backend framework | Flask + Flask-SocketIO | Already written, works well |
-| SocketIO async mode | `threading` | Required by ECGInferenceEngine threading model |
-| **DO NOT USE** | `eventlet` | Monkey-patches threading, deadlocks the inference queue |
-| Database | MongoDB Atlas | Free tier, document model fits JSON sensor payloads |
-| Big Data pattern | Bucket Pattern + TimeSeries | Prevents IOPS exhaustion on free tier |
-| Frontend | React + Vite | Team skill, fast setup |
-| Frontend routing | react-router-dom | Standard SPA routing |
-| Charting | Recharts | Lightweight, works with React |
-| Auth | JWT (PyJWT) | Stateless, works with REST + WS |
-| Backend hosting | Render (free Web Service) | Free Python hosting |
-| Frontend hosting | Vercel | Free, great for React/Vite |
-| IoT protocol | HTTP POST (not MQTT) | Simpler, no broker needed, ESP32 HTTPClient support |
+| Layer | Technology | Where it runs | Notes |
+|-------|-----------|--------------|-------|
+| ECG Sensor | AD8232 | Hardware | Analog output 0–3.3V |
+| ADC + Timing | ESP32 + GPIO34 | Hardware | 12-bit ADC, 250Hz hardware timer ISR |
+| Serial Bridge | USB cable | Physical | ESP32 → RPi `/dev/ttyUSB0` |
+| Edge Compute | Raspberry Pi 4B (4GB) | Hospital room | Runs full Python ML pipeline |
+| Edge OS | Raspberry Pi OS 64-bit (Bookworm) | RPi SD card | |
+| Edge Framework | Flask + Flask-SocketIO | RPi | `async_mode="threading"` — DO NOT use eventlet |
+| ML Model | scikit-learn RandomForest | RPi (local) | 14MB, loads once at boot |
+| Edge DB upload | pymongo (HTTP to MongoDB Atlas) | RPi | Summaries only |
+| Cloud API | Flask (cloud_api.py) | Render (free) | No ML, no serial, stateless REST |
+| Database | MongoDB Atlas M0 | Cloud | Free tier, ~512MB storage |
+| Frontend | React + Vite | Vercel (free) | |
+| Auth | JWT (PyJWT) | Cloud API + React | Stateless, no session storage needed |
+| Charts | Recharts | React | |
+| **DO NOT USE** | eventlet | Anywhere | Deadlocks threading model |
 
 ---
 
-## 4. System Data Flow
+## 5. Data Flow (v2 — RPi Edge Architecture)
 
 ```
 [AD8232 Sensor]
-      ↓ analog 0–3.3V
-[ESP32 GPIO34]
-      ↓ 12-bit ADC (0–4095), 250Hz hardware timer ISR
-      ↓ 1-second batch (250 samples) + NTP timestamp
-      ↓ HTTP POST  {"device_id", "timestamp", "ecg_values":[], "lead_off"}
-      ↓ Header: X-API-Key
-[Render: Flask /api/iot-data]
-      ↓ Verify API key → lookup device_id → resolve patient_id
-      ↓ Push 250 values into ECGInferenceEngine._raw_queue
-[ECGInferenceEngine._inference_loop (background thread)]
-      ↓ 5-second sliding window (1250 samples, 50% overlap)
-      ↓ bandpass_filter → pan_tompkins_qrs → extract_features → scaler → RF model
-      ↓ prediction: "Normal" or "ABNORMAL", probability, consecutive count
-      ↓ Save summary to MongoDB ECG_Summaries
-      ↓ If 3 consecutive ABNORMAL → save Alert to MongoDB Alerts
-[Flask push_data_loop (every 200ms)]
-      ↓ socketio.emit("update", {...}) to room:patient_<id>
-[Vercel: React Doctor Dashboard]
-      ↓ Socket.IO client subscribed to room:patient_<id>
-      ↓ Recharts live waveform + BPM gauge + alert banner
-[ESP32 alert polling (every 5s)]
-      ↓ GET /api/alert-status?device_id=<MAC>
-      ↓ If {"alert": true} → GPIO25 buzzer HIGH
+      │  analog 0–3.3V
+      ▼
+[ESP32 GPIO34 — 12-bit ADC at 250Hz]
+      │  Serial CSV: "<millis>,<ecg_val>,<lead_off>\n" at 115200 baud
+      │  USB cable (/dev/ttyUSB0 or /dev/ttyACM0)
+      ▼
+[Raspberry Pi 4B — ECGInferenceEngine running server.py]
+      │  _serial_reader_loop() reads from /dev/ttyUSB0
+      │  _raw_queue (queue.Queue) feeds samples to inference thread
+      │  5-second sliding window (1250 samples, 50% overlap)
+      │  bandpass_filter → pan_tompkins_qrs → extract_features → scaler → RF predict
+      │
+      ├─── Every 5s: HTTP POST summary ──► [Render: cloud_api.py /api/ingest/summary]
+      │                                          │
+      ├─── On ALERT: HTTP POST ──────────► [Render: cloud_api.py /api/ingest/alert]
+      │                                          │
+      └─── BUZZ_ON: Serial write ────────► [ESP32 GPIO25 Buzzer]  ◄─ immediate, no cloud needed
+                                                 ▼
+                                      [MongoDB Atlas]
+                                      ecg_summaries + alerts
+                                             │
+                              ┌──────────────┤
+                              │              │
+                    [Vercel: React]    [Render: cloud_api.py]
+                    Doctor polls       serves /api/doctor/patients
+                    /api/alerts        /api/patients/<id>/ecg-history
+                    every 30s          /api/alerts
 ```
 
 ---
 
-## 5. MongoDB Collection Schemas
+## 6. MongoDB Collection Schemas
 
-### 5.1 `users`
+### 6.1 `users`
 ```json
 {
   "_id": "ObjectId",
   "username": "dr_smith",
   "email": "smith@hospital.com",
   "password_hash": "<bcrypt hash>",
-  "role": "doctor",  // "admin" | "doctor" | "nurse" | "patient"
+  "role": "doctor",
   "created_at": "ISODate"
 }
 ```
+Roles: `"admin"` | `"doctor"` | `"nurse"` | `"patient"`
 
-### 5.2 `patients`
+### 6.2 `patients`
 ```json
 {
   "_id": "ObjectId",
-  "user_id": "ObjectId (→ users)",
+  "user_id": "ObjectId (→ users._id)",
   "name": "John Doe",
   "dob": "ISODate",
   "assigned_room": "101",
-  "assigned_doctors": ["ObjectId", ...],
-  "assigned_nurses": ["ObjectId", ...]
+  "assigned_doctors": ["ObjectId", "..."],
+  "assigned_nurses": ["ObjectId", "..."]
 }
 ```
 
-### 5.3 `devices`
+### 6.3 `devices`
 ```json
 {
   "_id": "ObjectId",
-  "device_id": "AA:BB:CC:DD:EE:FF",  // ESP32 MAC address — the unique room identifier
+  "device_id": "rpi-room-101",
   "room_number": "101",
-  "status": "active",  // "active" | "inactive"
+  "status": "active",
   "registered_at": "ISODate"
 }
 ```
+`device_id` is a human-readable unique string set by the admin (e.g., `rpi-room-101`). It is configured in the RPi's `.env` file as `EDGE_DEVICE_ID`.
 
-### 5.4 `ecg_summaries` — Bucket Pattern (Big Data)
-One document per 5-second inference window per patient.
+### 6.4 `ecg_summaries` — Bucket Pattern
+One document per 5-second inference window. This is the Big Data pattern — instead of one document per raw sample (would be 250 docs/sec), we store aggregated features.
 ```json
 {
   "_id": "ObjectId",
   "patient_id": "ObjectId",
+  "device_id": "rpi-room-101",
   "start_time": "ISODate",
   "end_time": "ISODate",
   "heart_rate": 72.4,
@@ -166,32 +193,19 @@ One document per 5-second inference window per patient.
   "beat_variance": 151.3,
   "r_peak_count": 6,
   "sqi": 0.9,
-  "prediction": "Normal",  // "Normal" | "ABNORMAL"
+  "prediction": "Normal",
   "probability": 0.15,
   "consecutive_count": 0
 }
 ```
 
-### 5.5 `ecg_rawbuckets` — Time Series Collection (Big Data)
-MongoDB native Time Series collection. One document per 1-second batch from ESP32.
-```json
-{
-  "patient_id": "ObjectId",       // metadata field (for time series)
-  "device_id": "AA:BB:CC:DD:EE:FF",
-  "timestamp": "ISODate",         // time field (MongoDB uses this for bucketing)
-  "ecg_values": [2048, 2051, ...], // 250-element array (1 second of raw ADC)
-  "lead_off": 0
-}
-```
-> **Note**: Create this as a MongoDB Time Series collection with `timeField: "timestamp"`, `metaField: "patient_id"`, `granularity: "seconds"`.
-
-### 5.6 `alerts`
+### 6.5 `alerts`
 ```json
 {
   "_id": "ObjectId",
   "patient_id": "ObjectId",
-  "device_id": "AA:BB:CC:DD:EE:FF",
-  "severity": "HIGH",  // "HIGH" (≥3 consecutive ABNORMAL)
+  "device_id": "rpi-room-101",
+  "severity": "HIGH",
   "timestamp": "ISODate",
   "consecutive_count": 4,
   "probability": 0.91,
@@ -199,81 +213,125 @@ MongoDB native Time Series collection. One document per 1-second batch from ESP3
   "acknowledged_by": null
 }
 ```
-> **Debounce rule**: Only create a new Alert if no unacknowledged Alert exists for the same `patient_id` in the last 5 minutes.
+**Debounce rule**: Only create a new Alert if no unacknowledged Alert exists for the same `patient_id` within the last 5 minutes.
+
+> **No raw ECG collection**: Raw 250Hz waveform data stays on RPi local storage (session CSV logs in `backend/logs/`). It is never uploaded to the cloud. This keeps MongoDB Atlas well within free tier limits.
 
 ---
 
-## 6. REST API Endpoints
+## 7. REST API Endpoints
 
-| Method | Path | Auth | Owner | Description |
-|--------|------|------|-------|-------------|
-| POST | `/api/auth/login` | None | Satyarth | Returns JWT |
-| POST | `/api/iot-data` | X-API-Key header | Satyarth | ESP32 data ingestion |
-| GET | `/api/alert-status` | X-API-Key header | Satyarth | ESP32 polls for alert |
-| GET | `/api/status` | None | Satyarth | Server health check |
-| POST | `/api/start` | JWT (admin) | Satyarth | Start inference engine |
-| POST | `/api/stop` | JWT (admin) | Satyarth | Stop inference engine |
-| POST | `/api/calibrate` | JWT (admin) | Satyarth | Calibrate baseline |
-| POST | `/api/admin/assign-device` | JWT (admin) | Rupam | Map MAC → room |
-| POST | `/api/admin/assign-patient` | JWT (admin) | Rupam | Map patient → room |
-| POST | `/api/admin/assign-doctor` | JWT (admin) | Rupam | Link doctor to patient |
-| POST | `/api/admin/users` | JWT (admin) | Rupam | Create user |
-| GET | `/api/doctor/patients` | JWT (doctor/nurse) | Deepika | Get assigned patients |
-| GET | `/api/patients/me` | JWT (patient) | Deepika | Get own records |
-| GET | `/api/patients/<id>/ecg-history` | JWT (doctor) | Deepika | Paginated ECG history |
+### Cloud API (Render — `cloud_api.py`)
+
+| Method | Path | Auth | Called by | Description |
+|--------|------|------|-----------|-------------|
+| POST | `/api/auth/login` | None | React | Returns JWT |
+| POST | `/api/ingest/summary` | X-Edge-Key | RPi | Save 5-sec summary |
+| POST | `/api/ingest/alert` | X-Edge-Key | RPi | Save alert |
+| GET | `/api/doctor/patients` | JWT (doctor/nurse) | React | Assigned patients list |
+| GET | `/api/patients/<id>/ecg-history` | JWT (doctor) | React | Paginated summaries |
+| GET | `/api/alerts` | JWT (doctor/nurse) | React | Unacknowledged alerts |
+| POST | `/api/alerts/<id>/acknowledge` | JWT (doctor/nurse) | React | Mark alert seen |
+| GET | `/api/patients/me` | JWT (patient) | React | Own records |
+| POST | `/api/admin/users` | JWT (admin) | React | Create user |
+| POST | `/api/admin/assign-device` | JWT (admin) | React | Map device_id → room |
+| POST | `/api/admin/assign-patient` | JWT (admin) | React | Map patient → room |
+| POST | `/api/admin/assign-doctor` | JWT (admin) | React | Link doctor to patient |
+| GET | `/api/status` | None | cron-job.org | Health check (keep Render awake) |
+
+### RPi Edge Server (`server.py` — local network only)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/start` | Start ECGInferenceEngine (serial or demo mode) |
+| POST | `/api/stop` | Stop engine |
+| POST | `/api/calibrate` | Start 30-second baseline calibration |
+| GET | `/api/status` | Engine status + current prediction |
+| WS | `socket.io` | Pushes ECG waveform + prediction every 200ms to local browser |
 
 ---
 
-## 7. Environment Variables
+## 8. Environment Variables
 
-All team members must copy `.env.example` to `.env` and fill in real values.
-**NEVER commit `.env` to git.**
-
+### RPi `.env` (on the Raspberry Pi at `~/ecg_edge/.env`)
 ```
-MONGO_URI             # From MongoDB Atlas → Connect → Drivers
-JWT_SECRET            # Any long random string (use: python -c "import secrets; print(secrets.token_hex(32))")
-IOT_API_KEY           # Any random string — hardcoded in ESP32 firmware
-FLASK_SECRET_KEY      # Any long random string
-VITE_API_BASE_URL     # http://localhost:5000 for dev, https://<render-url> for production
+MONGO_URI=mongodb+srv://ecg_admin:<password>@cluster0.xxxxx.mongodb.net/ecg_db
+FLASK_SECRET_KEY=<long random string>
+JWT_SECRET=<long random string>
+EDGE_DEVICE_ID=rpi-room-101
+SERIAL_PORT=/dev/ttyUSB0
+CLOUD_API_URL=https://<your-render-app>.onrender.com
+EDGE_KEY=<shared secret between RPi and Render>
 ```
+
+### Render `.env` (set in Render dashboard)
+```
+MONGO_URI=<same as RPi>
+JWT_SECRET=<same as RPi>
+FLASK_SECRET_KEY=<can be different>
+EDGE_KEY=<same shared secret as RPi>
+```
+
+### Vercel `.env` (set in Vercel dashboard)
+```
+VITE_API_BASE_URL=https://<your-render-app>.onrender.com
+```
+
+**Generate secure secrets**: `python3 -c "import secrets; print(secrets.token_hex(32))"`
+
+**NEVER commit any `.env` file to git.** Use `.env.example` as the template.
 
 ---
 
-## 8. Key ML Pipeline Facts
+## 9. ML Pipeline Facts
 
-- **Model**: Random Forest Classifier, trained on MIT-BIH Arrhythmia Database via `wfdb`
-- **Model file**: `backend/model/ecg_rf_model_v1.pkl` (14MB — large, consider Git LFS)
+- **Model**: Random Forest Classifier (scikit-learn), trained on MIT-BIH Arrhythmia Database
+- **Model file**: `backend/model/ecg_rf_model_v1.pkl` (14MB)
 - **Scaler**: `backend/model/scaler_v1.pkl` — StandardScaler, must be applied before prediction
 - **Input**: 6 HRV features: `heart_rate`, `rr_mean`, `rr_std`, `sdnn`, `rmssd`, `beat_variance`
 - **Window**: 1250 samples = 5 seconds at 250Hz, 50% overlap (new prediction every 2.5 seconds)
-- **Threshold**: `predict_proba > 0.70` → ABNORMAL (not just argmax, reduces false positives)
+- **Threshold**: `predict_proba > 0.70` → ABNORMAL (reduces false positives vs simple argmax)
 - **Alert**: 3 consecutive ABNORMAL windows → fire alert
-- **SQI gate**: If Signal Quality Index < 0.5 → skip inference, mark as "Poor Signal"
-- **Filtering**: 4th-order Butterworth bandpass 0.5–40 Hz applied before feature extraction
+- **SQI gate**: Signal Quality Index < 0.5 → skip inference, mark "Poor Signal"
+- **Filtering**: 4th-order Butterworth bandpass 0.5–40 Hz before feature extraction
+- **RPi 4B performance**: Full 5-second pipeline completes in ~50–150ms. No performance issue.
 
 ---
 
-## 9. ESP32 Firmware Facts
+## 10. ESP32 Firmware Facts (Unchanged — Dumb USB ADC Bridge)
 
-- **Chip**: ESP32 (dual-core)
-- **Sensor**: AD8232 single-lead ECG module
-- **ADC pin**: GPIO34 (input-only, 12-bit, 0–4095)
+- **Role in v2**: Purely an ADC + serial transmitter. No WiFi, no HTTP, no intelligence.
+- **ADC pin**: GPIO34, 12-bit (0–4095), AD8232 analog output
 - **Lead-off pins**: GPIO32 (LO+), GPIO33 (LO-)
-- **Buzzer pin**: GPIO25
-- **Sampling**: 250Hz via hardware timer ISR (4ms interval, IRAM_ATTR)
-- **Current mode**: USB Serial output only → **MUST be rewritten for WiFi HTTP**
-- **Target mode**: WiFi HTTP POST 250-sample batches every 1 second + alert polling every 5 seconds
+- **Buzzer pin**: GPIO25 — receives `BUZZ_ON`/`BUZZ_OFF` commands from RPi over Serial
+- **Sampling**: 250Hz via hardware timer ISR (4ms interval, `IRAM_ATTR`)
+- **Serial output**: `<millis>,<ecg_value>,<lead_off>\n` at 115200 baud
+- **Connection to RPi**: USB cable → `/dev/ttyUSB0` or `/dev/ttyACM0`
+- **Firmware changes needed**: **None** — current `ECG_Firmware.ino` is already correct for this role
 
 ---
 
-## 10. Known Risks & Mitigations
+## 11. RPi 4B Setup Facts
+
+- **OS**: Raspberry Pi OS 64-bit (Bookworm) — required for ARM64 Python packages
+- **Python**: 3.11+ available via apt
+- **Key packages**: numpy, scipy, scikit-learn — all have prebuilt ARM64 wheels, install via pip
+- **Serial access**: requires `sudo usermod -aG dialout $USER` for non-root serial port access
+- **Auto-start**: systemd service `ecg_edge.service` — starts on boot, restarts on crash
+- **Local access**: `http://<hostname>.local:5000` from any device on same WiFi
+- **Hostname**: set during OS flash in Raspberry Pi Imager (e.g., `ecg-node-101`)
+
+---
+
+## 12. Known Risks & Mitigations
 
 | Risk | Mitigation |
 |------|-----------|
-| Render cold start (50s) while ESP32 is streaming | Cron job at cron-job.org pings /api/status every 10 min |
-| MongoDB Atlas IOPS limit on free tier | Bucket Pattern + Time Series collection — not one doc per sample |
-| 14MB model deserialisation on cold start | Pre-load model at server startup, not per-request |
-| ESP32 HTTP timeout during Render wake-up | Exponential backoff retry (3 attempts) in firmware |
-| Credential leaks to GitHub | .gitignore + .env.example + team rule: no secrets in code |
-| Single-instance in-memory queue limitation | Acceptable for free tier + college demo; documented as known limitation |
-| Alert fatigue | 5-minute debounce window on Alert creation |
+| Render cold start (50s delay) | cron-job.org pings `/api/status` every 10 min. RPi retries upload 3 times with 5s delay. |
+| RPi loses internet mid-session | Inference continues locally. Summaries queued to a local file, flushed when reconnected. |
+| RPi crashes | systemd `Restart=always` with 5s cooldown brings it back automatically. |
+| MongoDB Atlas IOPS limit | No raw data in cloud. Only one doc per 5 seconds per patient. Free tier is very comfortable. |
+| Serial port not found on RPi | Check with `ls /dev/tty*` after plugging ESP32. Update `SERIAL_PORT` in `.env`. |
+| Credential leak to GitHub | `.gitignore` covers `.env`. `.env.example` is the only committed template. |
+| Alert fatigue | 5-minute debounce window on Alert document creation per patient. |
+| Single RPi instance limitation | Acceptable for college demo. Each room needs its own RPi + ESP32 unit. |
